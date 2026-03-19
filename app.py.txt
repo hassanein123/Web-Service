@@ -1,0 +1,29 @@
+from flask import Flask, request
+
+from validation.xbrl_validator import XBRLValidator
+
+app = Flask(__name__)
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    result = ""
+
+    if request.method == "POST":
+        file = request.files["file"]
+        xml = file.read().decode("utf-8")
+
+        validator = XBRLValidator(taxonomy="IFRS")
+        report = validator.validate(xml)
+
+        result = report.to_dict()
+
+    return f"""
+    <h2>XBRL Validator</h2>
+    <form method="post" enctype="multipart/form-data">
+        <input type="file" name="file" required>
+        <button type="submit">Validate</button>
+    </form>
+    <pre>{result}</pre>
+    """
+
+app.run(host="0.0.0.0", port=10000)

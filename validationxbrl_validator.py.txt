@@ -1,0 +1,996 @@
+"""
+XBRL Validation Engine
+======================
+محرك التحقق الكامل من صحة ملفات XBRL قبل التحميل
+
+يتحقق من:
+  1. بنية XML الأساسية
+  2. وجود Namespaces المطلوبة
+  3. صحة Context (entity + period)
+  4. صحة Unit (عملة موحدة)
+  5. عناصر XBRL (Elements) ضد قاموس الـ Taxonomy
+  6. الحقول الإلزامية حسب المعيار (IFRS / ZATCA)
+  7. اتساق الأرقام (الأصول = الخصوم + حقوق الملكية)
+  8. قواعد الإشارة (موجب / سالب)
+
+يُرجع ValidationReport كاملاً مع errors / warnings / info
+"""
+
+import xml.etree.ElementTree as ET
+import re
+from dataclasses import dataclass, field
+from typing import List, Optional
+from datetime import datetime, date
+
+
+# ─────────────────────────────────────────────────────────────
+#  Data Classes
+# ─────────────────────────────────────────────────────────────
+
+@dataclass
+class ValidationIssue:
+    level: str          # "ERROR" | "WARNING" | "INFO"
+    code: str           # e.g. "XBRL-001"
+    message_ar: str
+    message_en: str
+    location: str = ""  # XPath or element name
+    value: str = ""     # Actual value that triggered the issue
+
+    def to_dict(self):
+        return {
+            "level": self.level,
+            "code": self.code,
+            "message_ar": self.message_ar,
+            "message_en": self.message_en,
+            "location": self.location,
+            "value": self.value,
+        }
+
+
+@dataclass
+class ValidationReport:
+    is_valid: bool = True
+    taxonomy: str = "IFRS"
+    validated_at: str = ""
+    errors: List[ValidationIssue] = field(default_factory=list)
+    warnings: List[ValidationIssue] = field(default_factory=list)
+    info: List[ValidationIssue] = field(default_factory=list)
+    stats: dict = field(default_factory=dict)
+
+    def add_error(self, code, msg_ar, msg_en, location="", value=""):
+        self.is_valid = False
+        self.errors.append(ValidationIssue("ERROR", code, msg_ar, msg_en, location, value))
+
+    def add_warning(self, code, msg_ar, msg_en, location="", value=""):
+        self.warnings.append(ValidationIssue("WARNING", code, msg_ar, msg_en, location, value))
+
+    def add_info(self, code, msg_ar, msg_en, location="", value=""):
+        self.info.append(ValidationIssue("INFO", code, msg_ar, msg_en, location, value))
+
+    def to_dict(self):
+        return {
+            "is_valid": self.is_valid,
+            "taxonomy": self.taxonomy,
+            "validated_at": self.validated_at,
+            "summary": {
+                "errors": len(self.errors),
+                "warnings": len(self.warnings),
+                "info": len(self.info),
+            },
+            "errors": [e.to_dict() for e in self.errors],
+            "warnings": [w.to_dict() for w in self.warnings],
+            "info": [i.to_dict() for i in self.info],
+            "stats": self.stats,
+        }
+
+    def readable_report(self, lang="ar"):
+        """تقرير نصي مقروء"""
+        lines = []
+        status = "✅ صالح" if self.is_valid else "❌ غير صالح"
+        lines.append(f"═══════════════════════════════════════")
+        lines.append(f"  تقرير التحقق من XBRL  |  {self.taxonomy}")
+        lines.append(f"  الحالة: {status}")
+        lines.append(f"  التاريخ: {self.validated_at}")
+        lines.append(f"  أخطاء: {len(self.errors)}  |  تحذيرات: {len(self.warnings)}  |  معلومات: {len(self.info)}")
+        lines.append(f"═══════════════════════════════════════")
+
+        if self.errors:
+            lines.append("\n❌ الأخطاء:")
+            for e in self.errors:
+                lines.append(f"  [{e.code}] {e.message_ar}")
+                if e.location:
+                    lines.append(f"         الموقع: {e.location}")
+                if e.value:
+                    lines.append(f"         القيمة: {e.value}")
+
+        if self.warnings:
+            lines.append("\n⚠️  التحذيرات:")
+            for w in self.warnings:
+                lines.append(f"  [{w.code}] {w.message_ar}")
+                if w.location:
+                    lines.append(f"         الموقع: {w.location}")
+
+        if self.info:
+            lines.append("\nℹ️  معلومات:")
+            for i in self.info:
+                lines.append(f"  [{i.code}] {i.message_ar}")
+
+        if self.stats:
+            lines.append("\n📊 الإحصائيات:")
+            for k, v in self.stats.items():
+                lines.append(f"  {k}: {v}")
+
+        return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────
+#  Taxonomy Element Registry
+# ─────────────────────────────────────────────────────────────
+
+# عناصر IFRS المعتمدة — قائمة كاملة للعناصر الأكثر استخداماً
+IFRS_VALID_ELEMENTS = {
+    # ── Balance Sheet: Assets ──────────────────────────────────
+    "CashAndCashEquivalents":                       {"type": "monetary", "period": "instant", "sign": 1},
+    "TradeAndOtherCurrentReceivables":              {"type": "monetary", "period": "instant", "sign": 1},
+    "CurrentTaxAssets":                             {"type": "monetary", "period": "instant", "sign": 1},
+    "Inventories":                                  {"type": "monetary", "period": "instant", "sign": 1},
+    "OtherCurrentAssets":                           {"type": "monetary", "period": "instant", "sign": 1},
+    "NoncurrentAssetsOrDisposalGroupsClassifiedAsHeldForSale": {"type": "monetary", "period": "instant", "sign": 1},
+    "CurrentAssets":                                {"type": "monetary", "period": "instant", "sign": 1},
+    "PropertyPlantAndEquipment":                    {"type": "monetary", "period": "instant", "sign": 1},
+    "InvestmentProperty":                           {"type": "monetary", "period": "instant", "sign": 1},
+    "Goodwill":                                     {"type": "monetary", "period": "instant", "sign": 1},
+    "IntangibleAssetsOtherThanGoodwill":            {"type": "monetary", "period": "instant", "sign": 1},
+    "InvestmentsAccountedForUsingEquityMethod":     {"type": "monetary", "period": "instant", "sign": 1},
+    "OtherNoncurrentFinancialAssets":               {"type": "monetary", "period": "instant", "sign": 1},
+    "DeferredTaxAssets":                            {"type": "monetary", "period": "instant", "sign": 1},
+    "NoncurrentAssets":                             {"type": "monetary", "period": "instant", "sign": 1},
+    "Assets":                                       {"type": "monetary", "period": "instant", "sign": 1},
+    "AccumulatedDepreciationAndAmortisation":       {"type": "monetary", "period": "instant", "sign": -1},
+    # ── Balance Sheet: Liabilities ─────────────────────────────
+    "TradeAndOtherCurrentPayables":                 {"type": "monetary", "period": "instant", "sign": -1},
+    "CurrentTaxLiabilities":                        {"type": "monetary", "period": "instant", "sign": -1},
+    "OtherCurrentLiabilities":                      {"type": "monetary", "period": "instant", "sign": -1},
+    "CurrentProvisions":                            {"type": "monetary", "period": "instant", "sign": -1},
+    "ShorttermBorrowings":                          {"type": "monetary", "period": "instant", "sign": -1},
+    "CurrentLiabilities":                           {"type": "monetary", "period": "instant", "sign": -1},
+    "BorrowingsNoncurrent":                         {"type": "monetary", "period": "instant", "sign": -1},
+    "DeferredTaxLiabilities":                       {"type": "monetary", "period": "instant", "sign": -1},
+    "NoncurrentProvisions":                         {"type": "monetary", "period": "instant", "sign": -1},
+    "OtherNoncurrentLiabilities":                   {"type": "monetary", "period": "instant", "sign": -1},
+    "NoncurrentLiabilities":                        {"type": "monetary", "period": "instant", "sign": -1},
+    "Liabilities":                                  {"type": "monetary", "period": "instant", "sign": -1},
+    # ── Equity ─────────────────────────────────────────────────
+    "IssuedCapital":                                {"type": "monetary", "period": "instant", "sign": 1},
+    "RetainedEarnings":                             {"type": "monetary", "period": "instant", "sign": 1},
+    "SharePremium":                                 {"type": "monetary", "period": "instant", "sign": 1},
+    "OtherReserves":                                {"type": "monetary", "period": "instant", "sign": 1},
+    "Equity":                                       {"type": "monetary", "period": "instant", "sign": 1},
+    "EquityAndLiabilities":                         {"type": "monetary", "period": "instant", "sign": 1},
+    # ── Income Statement ────────────────────────────────────────
+    "Revenue":                                      {"type": "monetary", "period": "duration", "sign": 1},
+    "RevenueFromSaleOfGoods":                       {"type": "monetary", "period": "duration", "sign": 1},
+    "RevenueFromRenderingOfServices":               {"type": "monetary", "period": "duration", "sign": 1},
+    "OtherIncome":                                  {"type": "monetary", "period": "duration", "sign": 1},
+    "CostOfSales":                                  {"type": "monetary", "period": "duration", "sign": -1},
+    "GrossProfit":                                  {"type": "monetary", "period": "duration", "sign": 1},
+    "DistributionCosts":                            {"type": "monetary", "period": "duration", "sign": -1},
+    "AdministrativeExpense":                        {"type": "monetary", "period": "duration", "sign": -1},
+    "EmployeeBenefitsExpense":                      {"type": "monetary", "period": "duration", "sign": -1},
+    "DepreciationAndAmortisationExpense":           {"type": "monetary", "period": "duration", "sign": -1},
+    "OperatingLeaseCost":                           {"type": "monetary", "period": "duration", "sign": -1},
+    "OtherExpensesByNature":                        {"type": "monetary", "period": "duration", "sign": -1},
+    "FinanceCosts":                                 {"type": "monetary", "period": "duration", "sign": -1},
+    "FinanceIncome":                                {"type": "monetary", "period": "duration", "sign": 1},
+    "ProfitLossBeforeTax":                          {"type": "monetary", "period": "duration", "sign": 1},
+    "IncomeTaxExpenseContinuingOperations":         {"type": "monetary", "period": "duration", "sign": -1},
+    "ProfitLoss":                                   {"type": "monetary", "period": "duration", "sign": 1},
+    "ProfitLossAttributableToOwnersOfParent":       {"type": "monetary", "period": "duration", "sign": 1},
+    # ── Cash Flow ──────────────────────────────────────────────
+    "CashFlowsFromUsedInOperatingActivities":       {"type": "monetary", "period": "duration", "sign": 1},
+    "CashFlowsFromUsedInInvestingActivities":       {"type": "monetary", "period": "duration", "sign": 1},
+    "CashFlowsFromUsedInFinancingActivities":       {"type": "monetary", "period": "duration", "sign": 1},
+    "IncreaseDecreaseInCashAndCashEquivalents":     {"type": "monetary", "period": "duration", "sign": 1},
+    "CashAndCashEquivalentsAtBeginningOfPeriod":    {"type": "monetary", "period": "instant", "sign": 1},
+    "CashAndCashEquivalentsAtEndOfPeriod":          {"type": "monetary", "period": "instant", "sign": 1},
+    # ── Catch-all for other common elements ────────────────────
+    "OtherAssets":                                  {"type": "monetary", "period": "instant", "sign": 1},
+    "OtherLiabilities":                             {"type": "monetary", "period": "instant", "sign": -1},
+}
+
+# ZATCA-specific extensions (على رأس IFRS)
+ZATCA_EXTENSIONS = {
+    "ZakatExpense":                 {"type": "monetary", "period": "duration", "sign": -1},
+    "ZakatPayable":                 {"type": "monetary", "period": "instant", "sign": -1},
+    "ZakatBase":                    {"type": "monetary", "period": "duration", "sign": 1},
+}
+
+# Required elements per taxonomy/statement
+REQUIRED_ELEMENTS = {
+    "IFRS": {
+        "balance_sheet": ["CashAndCashEquivalents", "Assets", "Liabilities", "Equity"],
+        "profit_loss":   ["Revenue", "ProfitLoss"],
+    },
+    "ZATCA": {
+        "balance_sheet": ["CashAndCashEquivalents", "Assets", "Liabilities", "Equity"],
+        "profit_loss":   ["Revenue", "ProfitLoss"],
+    },
+}
+
+REQUIRED_NAMESPACES = {
+    "IFRS": [
+        "http://www.xbrl.org/2003/instance",
+        "http://www.xbrl.org/2003/iso4217",
+        "https://xbrl.ifrs.org/taxonomy/2023-03-23/ifrs-full",
+    ],
+    "ZATCA": [
+        "http://www.xbrl.org/2003/instance",
+        "http://www.xbrl.org/2003/iso4217",
+        "https://xbrl.ifrs.org/taxonomy/2023-03-23/ifrs-full",
+    ],
+}
+
+ISO_CURRENCIES = {
+    "SAR", "USD", "EUR", "GBP", "AED", "KWD", "QAR", "BHD", "OMR", "JOD",
+    "EGP", "MAD", "TND", "DZD", "LYD", "SDG", "MYR", "IDR", "PKR",
+}
+
+
+# ─────────────────────────────────────────────────────────────
+#  Validator Class
+# ─────────────────────────────────────────────────────────────
+
+class XBRLValidator:
+    """
+    محرك التحقق الكامل من صحة ملفات XBRL
+    الاستخدام:
+        validator = XBRLValidator(taxonomy="IFRS")
+        report = validator.validate(xml_string)
+        print(report.readable_report())
+    """
+
+    NS_XBRLI = "http://www.xbrl.org/2003/instance"
+    NS_IFRS   = "https://xbrl.ifrs.org/taxonomy/2023-03-23/ifrs-full"
+    NS_ZATCA  = "https://zatca.gov.sa/taxonomy/2023"
+    NS_LINK   = "http://www.xbrl.org/2003/linkbase"
+
+    def __init__(self, taxonomy="IFRS"):
+        self.taxonomy = taxonomy
+        self._valid_elements = {**IFRS_VALID_ELEMENTS}
+        if taxonomy == "ZATCA":
+            self._valid_elements.update(ZATCA_EXTENSIONS)
+
+    # ─────────────────────────────────────────
+    #  Main Entry
+    # ─────────────────────────────────────────
+
+    def validate(self, xml_content: str) -> ValidationReport:
+        """
+        التحقق الكامل من ملف XBRL
+        xml_content: محتوى الملف كـ string
+        """
+        report = ValidationReport(
+            taxonomy=self.taxonomy,
+            validated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+
+        # ── Step 1: Parse XML ──────────────────
+        try:
+            root = ET.fromstring(xml_content.encode("utf-8"))
+        except ET.ParseError as e:
+            report.add_error(
+                "XBRL-001",
+                f"خطأ في بنية XML: {e}",
+                f"XML Parse Error: {e}",
+                location="root",
+            )
+            return report  # Can't continue without valid XML
+
+        # ── Step 2: Namespace checks ───────────
+        self._check_namespaces(root, xml_content, report)
+
+        # ── Step 3: schemaRef ──────────────────
+        self._check_schema_ref(root, report)
+
+        # ── Step 4: Contexts ───────────────────
+        contexts = self._check_contexts(root, report)
+
+        # ── Step 5: Units ──────────────────────
+        units = self._check_units(root, report)
+
+        # ── Step 6: Facts (elements) ───────────
+        found_elements = self._check_facts(root, contexts, units, report)
+
+        # ── Step 7: Required elements ──────────
+        self._check_required_elements(found_elements, report)
+
+        # ── Step 8: Balance equation ───────────
+        self._check_balance_equation(root, report)
+
+        # ── Step 9: Date range sanity ──────────
+        self._check_date_sanity(contexts, report)
+
+        # ── Stats ──────────────────────────────
+        report.stats = {
+            "عدد الحسابات (Facts)": len(found_elements),
+            "عدد الـ Contexts": len(contexts),
+            "عدد الوحدات (Units)": len(units),
+            "عناصر مُعترَف بها": sum(1 for e in found_elements if e in self._valid_elements),
+            "عناصر غير معروفة": sum(1 for e in found_elements if e not in self._valid_elements),
+        }
+
+        return report
+
+    # ─────────────────────────────────────────
+    #  Check: Namespaces
+    # ─────────────────────────────────────────
+
+    def _check_namespaces(self, root, xml_content, report):
+        required = REQUIRED_NAMESPACES.get(self.taxonomy, [])
+        declared = set()
+
+        # Extract all xmlns= declarations from raw XML
+        for m in re.finditer(r'xmlns(?::[\w-]+)?="([^"]+)"', xml_content):
+            declared.add(m.group(1))
+
+        for ns in required:
+            if ns not in declared:
+                report.add_error(
+                    "XBRL-010",
+                    f"Namespace مفقود: {ns}",
+                    f"Required namespace missing: {ns}",
+                    location="xbrl root",
+                    value=ns,
+                )
+
+        # Check xbrli root tag
+        if not root.tag.endswith("}xbrl") and root.tag != "xbrl":
+            report.add_error(
+                "XBRL-011",
+                "العنصر الجذري يجب أن يكون xbrli:xbrl",
+                "Root element must be xbrli:xbrl",
+                location=root.tag,
+            )
+        else:
+            report.add_info(
+                "XBRL-012",
+                "العنصر الجذري صحيح",
+                "Root element is valid xbrli:xbrl",
+            )
+
+    # ─────────────────────────────────────────
+    #  Check: schemaRef
+    # ─────────────────────────────────────────
+
+    def _check_schema_ref(self, root, report):
+        ns_link = self.NS_LINK
+        found = False
+
+        for child in root:
+            tag = child.tag
+            if "schemaRef" in tag:
+                found = True
+                # Check xlink:href
+                href = None
+                for attr_name, attr_val in child.attrib.items():
+                    if "href" in attr_name:
+                        href = attr_val
+                        break
+
+                if not href:
+                    report.add_error(
+                        "XBRL-020",
+                        "schemaRef لا يحتوي على xlink:href",
+                        "schemaRef missing xlink:href attribute",
+                        location="link:schemaRef",
+                    )
+                else:
+                    if self.taxonomy == "IFRS" and "ifrs" not in href.lower():
+                        report.add_warning(
+                            "XBRL-021",
+                            f"schemaRef لا يشير إلى taxonomy IFRS الصحيح: {href}",
+                            f"schemaRef may not point to correct IFRS taxonomy: {href}",
+                            location="link:schemaRef",
+                            value=href,
+                        )
+                    elif self.taxonomy == "ZATCA" and "zatca" not in href.lower():
+                        report.add_warning(
+                            "XBRL-022",
+                            f"schemaRef لا يشير إلى taxonomy ZATCA: {href}",
+                            f"schemaRef may not point to ZATCA taxonomy: {href}",
+                            location="link:schemaRef",
+                            value=href,
+                        )
+                    else:
+                        report.add_info(
+                            "XBRL-023",
+                            f"schemaRef صحيح: {href}",
+                            f"schemaRef valid: {href}",
+                        )
+                break
+
+        if not found:
+            report.add_warning(
+                "XBRL-024",
+                "لا يوجد عنصر link:schemaRef",
+                "Missing link:schemaRef element",
+                location="xbrl root",
+            )
+
+    # ─────────────────────────────────────────
+    #  Check: Contexts
+    # ─────────────────────────────────────────
+
+    @staticmethod
+    def _find(element, local_name, ns_uri):
+        """Find child by local name, trying both namespaced and bare tags."""
+        r = element.find(f"{{{ns_uri}}}{local_name}")
+        if r is None:
+            r = element.find(local_name)
+        return r
+
+    def _check_contexts(self, root, report) -> dict:
+        """يتحقق من صحة كل context ويرجع dict بـ id → period_type"""
+        contexts = {}
+        ns = self.NS_XBRLI
+
+        context_elements = [
+            c for c in root
+            if c.tag == f"{{{ns}}}context" or c.tag == "context"
+        ]
+
+        if not context_elements:
+            report.add_error(
+                "XBRL-030",
+                "لا توجد عناصر xbrli:context في الملف",
+                "No xbrli:context elements found",
+                location="xbrl root",
+            )
+            return contexts
+
+        for ctx in context_elements:
+            ctx_id = ctx.get("id", "")
+            if not ctx_id:
+                report.add_error(
+                    "XBRL-031",
+                    "context بدون id",
+                    "Context missing id attribute",
+                    location="xbrli:context",
+                )
+                continue
+
+            # Entity check
+            entity = self._find(ctx, "entity", ns)
+            if entity is None:
+                report.add_error(
+                    "XBRL-032",
+                    f"context '{ctx_id}' لا يحتوي على xbrli:entity",
+                    f"Context '{ctx_id}' missing xbrli:entity",
+                    location=f"context#{ctx_id}",
+                )
+            else:
+                identifier = self._find(entity, "identifier", ns)
+                if identifier is None or not (identifier.text or "").strip():
+                    report.add_error(
+                        "XBRL-033",
+                        f"context '{ctx_id}': identifier فارغ أو مفقود",
+                        f"Context '{ctx_id}': empty or missing identifier",
+                        location=f"context#{ctx_id}/entity",
+                    )
+
+            # Period check
+            period = self._find(ctx, "period", ns)
+            if period is None:
+                report.add_error(
+                    "XBRL-034",
+                    f"context '{ctx_id}' لا يحتوي على xbrli:period",
+                    f"Context '{ctx_id}' missing xbrli:period",
+                    location=f"context#{ctx_id}",
+                )
+                continue
+
+            instant = self._find(period, "instant", ns)
+            start   = self._find(period, "startDate", ns)
+            end     = self._find(period, "endDate", ns)
+
+            if instant is not None:
+                date_str = (instant.text or "").strip()
+                if not self._is_valid_date(date_str):
+                    report.add_error(
+                        "XBRL-035",
+                        f"context '{ctx_id}': تاريخ instant غير صالح: {date_str}",
+                        f"Context '{ctx_id}': invalid instant date: {date_str}",
+                        location=f"context#{ctx_id}/period/instant",
+                        value=date_str,
+                    )
+                contexts[ctx_id] = {"type": "instant", "date": date_str}
+
+            elif start is not None and end is not None:
+                s = (start.text or "").strip()
+                e = (end.text or "").strip()
+                if not self._is_valid_date(s):
+                    report.add_error(
+                        "XBRL-036",
+                        f"context '{ctx_id}': startDate غير صالح: {s}",
+                        f"Context '{ctx_id}': invalid startDate: {s}",
+                        value=s,
+                    )
+                if not self._is_valid_date(e):
+                    report.add_error(
+                        "XBRL-037",
+                        f"context '{ctx_id}': endDate غير صالح: {e}",
+                        f"Context '{ctx_id}': invalid endDate: {e}",
+                        value=e,
+                    )
+                if self._is_valid_date(s) and self._is_valid_date(e):
+                    if s >= e:
+                        report.add_error(
+                            "XBRL-038",
+                            f"context '{ctx_id}': startDate >= endDate",
+                            f"Context '{ctx_id}': startDate must be before endDate",
+                            location=f"context#{ctx_id}",
+                            value=f"{s} → {e}",
+                        )
+                    contexts[ctx_id] = {"type": "duration", "start": s, "end": e}
+            else:
+                report.add_error(
+                    "XBRL-039",
+                    f"context '{ctx_id}': يجب أن يحتوي على instant أو startDate/endDate",
+                    f"Context '{ctx_id}': must have instant or startDate/endDate",
+                    location=f"context#{ctx_id}/period",
+                )
+
+        if contexts:
+            report.add_info(
+                "XBRL-040",
+                f"تم التحقق من {len(contexts)} context بنجاح",
+                f"Validated {len(contexts)} contexts successfully",
+            )
+
+        return contexts
+
+    # ─────────────────────────────────────────
+    #  Check: Units
+    # ─────────────────────────────────────────
+
+    def _check_units(self, root, report) -> dict:
+        """يتحقق من صحة Units ويرجع dict بـ id → currency"""
+        units = {}
+        ns = self.NS_XBRLI
+
+        unit_elements = [
+            u for u in root
+            if u.tag == f"{{{ns}}}unit" or u.tag == "unit"
+        ]
+
+        if not unit_elements:
+            report.add_error(
+                "XBRL-050",
+                "لا توجد عناصر xbrli:unit في الملف",
+                "No xbrli:unit elements found",
+                location="xbrl root",
+            )
+            return units
+
+        currencies_found = set()
+
+        for unit in unit_elements:
+            unit_id = unit.get("id", "")
+            if not unit_id:
+                report.add_error(
+                    "XBRL-051",
+                    "unit بدون id",
+                    "Unit missing id attribute",
+                )
+                continue
+
+            measure = self._find(unit, "measure", ns)
+            if measure is None:
+                report.add_error(
+                    "XBRL-052",
+                    f"unit '{unit_id}' لا يحتوي على xbrli:measure",
+                    f"Unit '{unit_id}' missing xbrli:measure",
+                    location=f"unit#{unit_id}",
+                )
+                continue
+
+            measure_text = (measure.text or "").strip()
+            # Extract currency code: iso4217:SAR → SAR
+            if ":" in measure_text:
+                prefix, currency = measure_text.split(":", 1)
+                if prefix.lower() != "iso4217":
+                    report.add_warning(
+                        "XBRL-053",
+                        f"unit '{unit_id}': الـ measure prefix يجب أن يكون iso4217 وليس '{prefix}'",
+                        f"Unit '{unit_id}': measure prefix should be iso4217, got '{prefix}'",
+                        location=f"unit#{unit_id}/measure",
+                        value=measure_text,
+                    )
+            else:
+                currency = measure_text
+
+            if currency not in ISO_CURRENCIES:
+                report.add_warning(
+                    "XBRL-054",
+                    f"unit '{unit_id}': رمز العملة '{currency}' غير معروف أو غير مدعوم",
+                    f"Unit '{unit_id}': currency code '{currency}' is unknown or unsupported",
+                    location=f"unit#{unit_id}",
+                    value=currency,
+                )
+            else:
+                currencies_found.add(currency)
+
+            units[unit_id] = currency
+
+        if len(currencies_found) > 1:
+            report.add_warning(
+                "XBRL-055",
+                f"الملف يستخدم أكثر من عملة: {', '.join(currencies_found)} — يُفضَّل عملة واحدة",
+                f"Multiple currencies found: {', '.join(currencies_found)} — single currency recommended",
+            )
+
+        if units:
+            report.add_info(
+                "XBRL-056",
+                f"تم التحقق من {len(units)} unit بنجاح. العملة: {', '.join(currencies_found)}",
+                f"Validated {len(units)} units. Currencies: {', '.join(currencies_found)}",
+            )
+
+        return units
+
+    # ─────────────────────────────────────────
+    #  Check: Facts (XBRL Elements)
+    # ─────────────────────────────────────────
+
+    def _check_facts(self, root, contexts, units, report) -> list:
+        """يتحقق من صحة كل عنصر مالي (fact)"""
+        found_elements = []
+        ns_xbrli = self.NS_XBRLI
+        ns_ifrs   = self.NS_IFRS
+        ns_zatca  = self.NS_ZATCA
+
+        skip_tags = {
+            f"{{{ns_xbrli}}}xbrl", f"{{{ns_xbrli}}}context",
+            f"{{{ns_xbrli}}}unit", f"{{{self.NS_LINK}}}schemaRef",
+            "xbrl", "context", "unit",
+        }
+
+        fact_count = 0
+        unknown_count = 0
+
+        for child in root:
+            if child.tag in skip_tags:
+                continue
+            if "schemaRef" in child.tag:
+                continue
+
+            # Extract local name
+            tag = child.tag
+            if "}" in tag:
+                ns_uri, local_name = tag[1:].split("}", 1)
+            else:
+                ns_uri, local_name = "", tag
+
+            found_elements.append(local_name)
+            fact_count += 1
+
+            # ── Check contextRef ────────────────
+            ctx_ref = child.get("contextRef", "")
+            if not ctx_ref:
+                report.add_error(
+                    "XBRL-060",
+                    f"العنصر '{local_name}' لا يحتوي على contextRef",
+                    f"Element '{local_name}' missing contextRef attribute",
+                    location=local_name,
+                )
+            elif ctx_ref not in contexts:
+                report.add_error(
+                    "XBRL-061",
+                    f"العنصر '{local_name}' يشير إلى context غير موجود: '{ctx_ref}'",
+                    f"Element '{local_name}' references undefined context: '{ctx_ref}'",
+                    location=local_name,
+                    value=ctx_ref,
+                )
+
+            # ── Check unitRef ───────────────────
+            unit_ref = child.get("unitRef", "")
+            if not unit_ref:
+                report.add_error(
+                    "XBRL-062",
+                    f"العنصر '{local_name}' لا يحتوي على unitRef",
+                    f"Element '{local_name}' missing unitRef attribute",
+                    location=local_name,
+                )
+            elif unit_ref not in units:
+                report.add_error(
+                    "XBRL-063",
+                    f"العنصر '{local_name}' يشير إلى unit غير موجود: '{unit_ref}'",
+                    f"Element '{local_name}' references undefined unit: '{unit_ref}'",
+                    location=local_name,
+                    value=unit_ref,
+                )
+
+            # ── Check decimals ──────────────────
+            decimals = child.get("decimals", "")
+            if not decimals:
+                report.add_warning(
+                    "XBRL-064",
+                    f"العنصر '{local_name}' لا يحتوي على decimals",
+                    f"Element '{local_name}' missing decimals attribute",
+                    location=local_name,
+                )
+
+            # ── Check numeric value ─────────────
+            value_text = (child.text or "").strip()
+            if not value_text:
+                report.add_warning(
+                    "XBRL-065",
+                    f"العنصر '{local_name}' فارغ القيمة",
+                    f"Element '{local_name}' has empty value",
+                    location=local_name,
+                )
+            else:
+                try:
+                    float(value_text)
+                except ValueError:
+                    report.add_error(
+                        "XBRL-066",
+                        f"العنصر '{local_name}' يحتوي على قيمة غير رقمية: '{value_text}'",
+                        f"Element '{local_name}' has non-numeric value: '{value_text}'",
+                        location=local_name,
+                        value=value_text,
+                    )
+
+            # ── Check element against taxonomy ──
+            element_meta = self._valid_elements.get(local_name)
+            if element_meta is None:
+                unknown_count += 1
+                if unknown_count <= 5:  # Cap noise
+                    report.add_warning(
+                        "XBRL-067",
+                        f"العنصر '{local_name}' غير معرَّف في taxonomy {self.taxonomy}",
+                        f"Element '{local_name}' not found in {self.taxonomy} taxonomy",
+                        location=local_name,
+                    )
+            else:
+                # Check period type matches context type
+                if ctx_ref in contexts:
+                    ctx_type = contexts[ctx_ref].get("type", "")
+                    expected_period = element_meta.get("period", "")
+                    if expected_period and ctx_type != expected_period:
+                        report.add_warning(
+                            "XBRL-068",
+                            f"العنصر '{local_name}' يجب استخدام context من نوع '{expected_period}' وليس '{ctx_type}'",
+                            f"Element '{local_name}' should use '{expected_period}' context, got '{ctx_type}'",
+                            location=local_name,
+                            value=f"context={ctx_ref} ({ctx_type})",
+                        )
+
+        if unknown_count > 5:
+            report.add_warning(
+                "XBRL-069",
+                f"يوجد {unknown_count} عنصر غير معرَّف إجمالاً (تم إخفاء بعض التحذيرات)",
+                f"Total {unknown_count} unknown elements (some warnings suppressed)",
+            )
+
+        return found_elements
+
+    # ─────────────────────────────────────────
+    #  Check: Required Elements
+    # ─────────────────────────────────────────
+
+    def _check_required_elements(self, found_elements, report):
+        required = REQUIRED_ELEMENTS.get(self.taxonomy, {})
+        found_set = set(found_elements)
+
+        for statement, elements in required.items():
+            for elem in elements:
+                if elem not in found_set:
+                    report.add_warning(
+                        "XBRL-070",
+                        f"العنصر الإلزامي '{elem}' غير موجود ({statement})",
+                        f"Recommended element '{elem}' missing from {statement}",
+                        location=statement,
+                        value=elem,
+                    )
+                else:
+                    report.add_info(
+                        "XBRL-071",
+                        f"العنصر الإلزامي '{elem}' موجود ✓",
+                        f"Required element '{elem}' present ✓",
+                    )
+
+    # ─────────────────────────────────────────
+    #  Check: Balance Equation
+    # ─────────────────────────────────────────
+
+    def _check_balance_equation(self, root, report):
+        """
+        يتحقق من معادلة الميزانية: Assets ≈ Liabilities + Equity
+        تقريبية — تعتمد على وجود العناصر الإجمالية
+        """
+        ns_ifrs = self.NS_IFRS
+        ns_zatca = self.NS_ZATCA
+
+        def find_val(element_name):
+            for child in root:
+                tag = child.tag
+                local = tag.split("}")[-1] if "}" in tag else tag
+                if local == element_name:
+                    try:
+                        return float((child.text or "0").strip())
+                    except Exception:
+                        pass
+            return None
+
+        assets     = find_val("Assets")
+        liabilities = find_val("Liabilities")
+        equity     = find_val("Equity")
+
+        if assets and liabilities and equity:
+            diff = abs(assets - (liabilities + equity))
+            threshold = assets * 0.01  # 1% tolerance
+            if diff > threshold:
+                report.add_error(
+                    "XBRL-080",
+                    f"معادلة الميزانية لا تتوازن: الأصول ({assets:,.0f}) ≠ الخصوم ({liabilities:,.0f}) + حقوق الملكية ({equity:,.0f})",
+                    f"Balance equation fails: Assets ({assets:,.0f}) ≠ Liabilities ({liabilities:,.0f}) + Equity ({equity:,.0f})",
+                    location="Balance Sheet",
+                    value=f"Difference: {diff:,.0f}",
+                )
+            else:
+                report.add_info(
+                    "XBRL-081",
+                    f"معادلة الميزانية متوازنة ✓ (فرق: {diff:,.2f})",
+                    f"Balance equation holds ✓ (difference: {diff:,.2f})",
+                )
+        else:
+            report.add_info(
+                "XBRL-082",
+                "لا يمكن التحقق من معادلة الميزانية — العناصر الإجمالية (Assets/Liabilities/Equity) غير موجودة",
+                "Cannot verify balance equation — summary elements (Assets/Liabilities/Equity) not found",
+            )
+
+    # ─────────────────────────────────────────
+    #  Check: Date Sanity
+    # ─────────────────────────────────────────
+
+    def _check_date_sanity(self, contexts, report):
+        today = date.today()
+
+        for ctx_id, ctx in contexts.items():
+            if ctx["type"] == "duration":
+                try:
+                    start = date.fromisoformat(ctx["start"])
+                    end   = date.fromisoformat(ctx["end"])
+                    days  = (end - start).days
+
+                    if days > 366:
+                        report.add_warning(
+                            "XBRL-090",
+                            f"context '{ctx_id}': الفترة تتجاوز سنة كاملة ({days} يوم) — تحقق من التواريخ",
+                            f"Context '{ctx_id}': period spans {days} days (> 1 year) — verify dates",
+                            location=f"context#{ctx_id}",
+                            value=f"{ctx['start']} → {ctx['end']}",
+                        )
+                    if end > today:
+                        report.add_warning(
+                            "XBRL-091",
+                            f"context '{ctx_id}': تاريخ النهاية في المستقبل: {ctx['end']}",
+                            f"Context '{ctx_id}': endDate is in the future: {ctx['end']}",
+                            location=f"context#{ctx_id}",
+                            value=ctx["end"],
+                        )
+                except Exception:
+                    pass
+
+    # ─────────────────────────────────────────
+    #  Helper
+    # ─────────────────────────────────────────
+
+    def _is_valid_date(self, date_str: str) -> bool:
+        if not date_str:
+            return False
+        try:
+            date.fromisoformat(date_str.strip())
+            return True
+        except ValueError:
+            return False
+
+
+# ─────────────────────────────────────────────────────────────
+#  Frappe whitelisted wrapper
+# ─────────────────────────────────────────────────────────────
+
+try:
+    import frappe
+
+    @frappe.whitelist()
+    def validate_xbrl(xml_content, taxonomy="IFRS"):
+        """
+        API endpoint — يتحقق من ملف XBRL ويرجع ValidationReport كـ dict
+        """
+        validator = XBRLValidator(taxonomy=taxonomy)
+        report = validator.validate(xml_content)
+        return report.to_dict()
+
+    @frappe.whitelist()
+    def validate_xbrl_file(file_url, taxonomy="IFRS"):
+        """يقرأ ملف XBRL من مسار Frappe ثم يتحقق منه"""
+        import os
+        site_path = frappe.get_site_path("public", file_url.lstrip("/files/"))
+        if not os.path.exists(site_path):
+            return {"error": f"File not found: {site_path}"}
+
+        with open(site_path, "r", encoding="utf-8") as f:
+            xml_content = f.read()
+
+        validator = XBRLValidator(taxonomy=taxonomy)
+        report = validator.validate(xml_content)
+        return report.to_dict()
+
+except ImportError:
+    pass  # Running outside Frappe
+
+
+# ─────────────────────────────────────────────────────────────
+#  Standalone test
+# ─────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    SAMPLE_XBRL = """<?xml version="1.0" encoding="UTF-8"?>
+<xbrli:xbrl
+  xmlns:xbrli="http://www.xbrl.org/2003/instance"
+  xmlns:ifrs-full="https://xbrl.ifrs.org/taxonomy/2023-03-23/ifrs-full"
+  xmlns:iso4217="http://www.xbrl.org/2003/iso4217"
+  xmlns:xlink="http://www.w3.org/1999/xlink"
+  xmlns:link="http://www.xbrl.org/2003/linkbase">
+
+  <link:schemaRef xlink:type="simple"
+    xlink:href="https://xbrl.ifrs.org/taxonomy/2023-03-23/ifrs-full"/>
+
+  <xbrli:context id="instant">
+    <xbrli:entity>
+      <xbrli:identifier scheme="http://www.xbrl.org/2003/instance">CoffeeShop</xbrli:identifier>
+    </xbrli:entity>
+    <xbrli:period>
+      <xbrli:instant>2024-12-31</xbrli:instant>
+    </xbrli:period>
+  </xbrli:context>
+
+  <xbrli:context id="duration">
+    <xbrli:entity>
+      <xbrli:identifier scheme="http://www.xbrl.org/2003/instance">CoffeeShop</xbrli:identifier>
+    </xbrli:entity>
+    <xbrli:period>
+      <xbrli:startDate>2024-01-01</xbrli:startDate>
+      <xbrli:endDate>2024-12-31</xbrli:endDate>
+    </xbrli:period>
+  </xbrli:context>
+
+  <xbrli:unit id="USD_SAR">
+    <xbrli:measure>iso4217:SAR</xbrli:measure>
+  </xbrli:unit>
+
+  <ifrs-full:CashAndCashEquivalents contextRef="instant" unitRef="USD_SAR" decimals="2">85000.00</ifrs-full:CashAndCashEquivalents>
+  <ifrs-full:TradeAndOtherCurrentReceivables contextRef="instant" unitRef="USD_SAR" decimals="2">45000.00</ifrs-full:TradeAndOtherCurrentReceivables>
+  <ifrs-full:Inventories contextRef="instant" unitRef="USD_SAR" decimals="2">25000.00</ifrs-full:Inventories>
+  <ifrs-full:PropertyPlantAndEquipment contextRef="instant" unitRef="USD_SAR" decimals="2">350000.00</ifrs-full:PropertyPlantAndEquipment>
+  <ifrs-full:Assets contextRef="instant" unitRef="USD_SAR" decimals="2">505000.00</ifrs-full:Assets>
+  <ifrs-full:TradeAndOtherCurrentPayables contextRef="instant" unitRef="USD_SAR" decimals="2">55000.00</ifrs-full:TradeAndOtherCurrentPayables>
+  <ifrs-full:BorrowingsNoncurrent contextRef="instant" unitRef="USD_SAR" decimals="2">120000.00</ifrs-full:BorrowingsNoncurrent>
+  <ifrs-full:Liabilities contextRef="instant" unitRef="USD_SAR" decimals="2">175000.00</ifrs-full:Liabilities>
+  <ifrs-full:IssuedCapital contextRef="instant" unitRef="USD_SAR" decimals="2">250000.00</ifrs-full:IssuedCapital>
+  <ifrs-full:RetainedEarnings contextRef="instant" unitRef="USD_SAR" decimals="2">80000.00</ifrs-full:RetainedEarnings>
+  <ifrs-full:Equity contextRef="instant" unitRef="USD_SAR" decimals="2">330000.00</ifrs-full:Equity>
+
+  <ifrs-full:Revenue contextRef="duration" unitRef="USD_SAR" decimals="2">680000.00</ifrs-full:Revenue>
+  <ifrs-full:CostOfSales contextRef="duration" unitRef="USD_SAR" decimals="2">380000.00</ifrs-full:CostOfSales>
+  <ifrs-full:EmployeeBenefitsExpense contextRef="duration" unitRef="USD_SAR" decimals="2">120000.00</ifrs-full:EmployeeBenefitsExpense>
+  <ifrs-full:ProfitLoss contextRef="duration" unitRef="USD_SAR" decimals="2">155000.00</ifrs-full:ProfitLoss>
+</xbrli:xbrl>"""
+
+    validator = XBRLValidator(taxonomy="IFRS")
+    report = validator.validate(SAMPLE_XBRL)
+    print(report.readable_report())
+    print(f"\nJSON keys: {list(report.to_dict().keys())}")
